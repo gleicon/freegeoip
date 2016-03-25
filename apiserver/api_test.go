@@ -21,7 +21,7 @@ func newTestHandler() (http.Handler, error) {
 	c.APIPrefix = "/api"
 	c.PublicDir = "."
 	c.DB = filepath.Join(filepath.Dir(f), "../testdata/db.gz")
-	c.RateLimitLimit = 5
+	c.RateLimitLimit = 10
 	c.RateLimitBackend = "map"
 	c.Silent = true
 	return NewHandler(c)
@@ -113,6 +113,74 @@ func TestWriters(t *testing.T) {
 		f.ServeHTTP(w, &r)
 		if w.Code != http.StatusOK {
 			t.Fatalf("Test %d: Unexpected response: %d %s", i, w.Code, w.Body.String())
+		}
+	}
+}
+
+func BenchmarkTestHandlerWithoutCache(b *testing.B) {
+	_, f, _, _ := runtime.Caller(0)
+	c := NewConfig()
+	c.APIPrefix = "/api"
+	c.PublicDir = "."
+	c.DB = filepath.Join(filepath.Dir(f), "../testdata/db.gz")
+	c.RateLimitLimit = 10
+	c.RateLimitBackend = "map"
+	c.Silent = true
+	c.LocalLRUCache = false
+	api, err := NewApiHandler(c)
+
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	w := &httptest.ResponseRecorder{Body: &bytes.Buffer{}}
+	r := &http.Request{
+		Method:     "GET",
+		URL:        &url.URL{Path: "/api/json/200.1.2.3"},
+		RemoteAddr: "[::1]:1905",
+	}
+	for n := 0; n < b.N; n++ {
+		mm, err := NewMux(c, api)
+		if err != nil {
+			b.Fatal(err)
+		}
+		mm.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			b.Fatalf("Unexpected response: %d %s", w.Code, w.Body.String())
+		}
+	}
+}
+
+func BenchmarkTestHandlerWithCache(b *testing.B) {
+	_, f, _, _ := runtime.Caller(0)
+	c := NewConfig()
+	c.APIPrefix = "/api"
+	c.PublicDir = "."
+	c.DB = filepath.Join(filepath.Dir(f), "../testdata/db.gz")
+	c.RateLimitLimit = 10
+	c.RateLimitBackend = "map"
+	c.Silent = true
+	c.LocalLRUCache = true
+	api, err := NewApiHandler(c)
+
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	w := &httptest.ResponseRecorder{Body: &bytes.Buffer{}}
+	r := &http.Request{
+		Method:     "GET",
+		URL:        &url.URL{Path: "/api/json/200.1.2.3"},
+		RemoteAddr: "[::1]:1905",
+	}
+	for n := 0; n < b.N; n++ {
+		mm, err := NewMux(c, api)
+		if err != nil {
+			b.Fatal(err)
+		}
+		mm.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			b.Fatalf("Unexpected response: %d %s", w.Code, w.Body.String())
 		}
 	}
 }

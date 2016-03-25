@@ -42,9 +42,7 @@ type apiHandler struct {
 	cache *cache.Cache
 }
 
-// NewHandler creates an http handler for the freegeoip server that
-// can be embedded in other servers.
-func NewHandler(c *Config) (http.Handler, error) {
+func NewApiHandler(c *Config) (*apiHandler, error) {
 	db, err := openDB(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %v", err)
@@ -54,8 +52,18 @@ func NewHandler(c *Config) (http.Handler, error) {
 		AllowedMethods:   []string{"GET"},
 		AllowCredentials: true,
 	})
-	lruCache := cache.New(30*time.Minute, 5*time.Minute) // default expiration: 30m, purge cycle: 5m
+	var lruCache *cache.Cache
+	if c.LocalLRUCache == true {
+		lruCache = cache.New(30*time.Minute, 5*time.Minute) // default expiration: 30m, purge cycle: 5m
+	}
 	f := &apiHandler{db: db, conf: c, cors: cf, cache: lruCache}
+	go watchEvents(db)
+	return f, nil
+}
+
+// NewHandler creates an http handler for the freegeoip server that
+// can be embedded in other servers.
+func NewMux(c *Config, f *apiHandler) (http.Handler, error) {
 	mc := httpmux.DefaultConfig
 	if err := f.config(&mc); err != nil {
 		return nil, err
@@ -64,7 +72,24 @@ func NewHandler(c *Config) (http.Handler, error) {
 	mux.GET("/csv/*host", f.register("csv", csvWriter))
 	mux.GET("/xml/*host", f.register("xml", xmlWriter))
 	mux.GET("/json/*host", f.register("json", jsonWriter))
-	go watchEvents(db)
+	return mux, nil
+}
+
+// NewHandler creates an http handler for the freegeoip server that
+// can be embedded in other servers.
+func NewHandler(c *Config) (http.Handler, error) {
+	f, err := NewApiHandler(c)
+	if err != nil {
+		return nil, err
+	}
+	mc := httpmux.DefaultConfig
+	if err := f.config(&mc); err != nil {
+		return nil, err
+	}
+	mux := httpmux.NewHandler(&mc)
+	mux.GET("/csv/*host", f.register("csv", csvWriter))
+	mux.GET("/xml/*host", f.register("xml", xmlWriter))
+	mux.GET("/json/*host", f.register("json", jsonWriter))
 	return mux, nil
 }
 
@@ -146,7 +171,17 @@ func (f *apiHandler) iplookup(writer writerFunc) http.HandlerFunc {
 				host = r.RemoteAddr
 			}
 		}
-		resp, found := f.cache.Get(host)
+		var found bool
+		var resp *responseRecord
+		if f.conf.LocalLRUCache == true {
+			rr, ff := f.cache.Get(host)
+			if rr != nil {
+				resp = rr.(*responseRecord)
+			}
+			found = ff
+		} else {
+			found = false
+		}
 		if found == false {
 
 			ips, err := net.LookupIP(host)
@@ -162,10 +197,12 @@ func (f *apiHandler) iplookup(writer writerFunc) http.HandlerFunc {
 			}
 
 			resp = q.Record(ip, r.Header.Get("Accept-Language"))
-			f.cache.Set(host, resp, 30*time.Minute)
+			if f.conf.LocalLRUCache == true {
+				f.cache.Set(host, resp, 30*time.Minute)
+			}
 		}
 		w.Header().Set("X-Database-Date", f.db.Date().Format(http.TimeFormat))
-		writer(w, r, resp.(*responseRecord))
+		writer(w, r, resp)
 	}
 }
 
