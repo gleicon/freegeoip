@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"freegeoip"
 	"io"
 	"log"
 	"math"
@@ -18,25 +19,21 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
+	"time"
 
-	"github.com/bradfitz/gomemcache/memcache"
-	"github.com/fiorix/go-redis/redis"
+	//	"github.com/fiorix/freegeoip"
 	"github.com/go-web/httplog"
 	"github.com/go-web/httpmux"
-	"github.com/go-web/httprl"
-	"github.com/go-web/httprl/memcacherl"
-	"github.com/go-web/httprl/redisrl"
+	"github.com/pmylund/go-cache"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/cors"
-
-	"github.com/fiorix/freegeoip"
 )
 
 type apiHandler struct {
-	db   *freegeoip.DB
-	conf *Config
-	cors *cors.Cors
+	db    *freegeoip.DB
+	conf  *Config
+	cors  *cors.Cors
+	cache *cache.Cache
 }
 
 // NewHandler creates an http handler for the freegeoip server that
@@ -51,7 +48,8 @@ func NewHandler(c *Config) (http.Handler, error) {
 		AllowedMethods:   []string{"GET"},
 		AllowCredentials: true,
 	})
-	f := &apiHandler{db: db, conf: c, cors: cf}
+	lruCache := cache.New(30*time.Minute, 5*time.Minute) // default expiration: 30m, purge cycle: 5m
+	f := &apiHandler{db: db, conf: c, cors: cf, cache: lruCache}
 	mc := httpmux.DefaultConfig
 	if err := f.config(&mc); err != nil {
 		return nil, err
@@ -76,13 +74,6 @@ func (f *apiHandler) config(mc *httpmux.Config) error {
 		mc.UseFunc(httplog.ApacheCombinedFormat(f.conf.accessLogger()))
 	}
 	mc.UseFunc(f.metrics)
-	if f.conf.RateLimitLimit > 0 {
-		rl, err := newRateLimiter(f.conf)
-		if err != nil {
-			return fmt.Errorf("failed to create rate limiter: %v", err)
-		}
-		mc.Use(rl.Handle)
-	}
 	return nil
 }
 
@@ -142,20 +133,26 @@ func (f *apiHandler) iplookup(writer writerFunc) http.HandlerFunc {
 				host = r.RemoteAddr
 			}
 		}
-		ips, err := net.LookupIP(host)
-		if err != nil || len(ips) == 0 {
-			http.NotFound(w, r)
-			return
-		}
-		ip, q := ips[rand.Intn(len(ips))], &geoipQuery{}
-		err = f.db.Lookup(ip, &q.DefaultQuery)
-		if err != nil {
-			http.Error(w, "Try again later.", http.StatusServiceUnavailable)
-			return
+		resp, found := f.cache.Get(host)
+		if found == false {
+
+			ips, err := net.LookupIP(host)
+			if err != nil || len(ips) == 0 {
+				http.NotFound(w, r)
+				return
+			}
+			ip, q := ips[rand.Intn(len(ips))], &geoipQuery{}
+			err = f.db.Lookup(ip, &q.DefaultQuery)
+			if err != nil {
+				http.Error(w, "Try again later.", http.StatusServiceUnavailable)
+				return
+			}
+
+			resp = q.Record(ip, r.Header.Get("Accept-Language"))
+			f.cache.Set(host, q.Record, 30*time.Minute)
 		}
 		w.Header().Set("X-Database-Date", f.db.Date().Format(http.TimeFormat))
-		resp := q.Record(ip, r.Header.Get("Accept-Language"))
-		writer(w, r, resp)
+		writer(w, r, resp.(*responseRecord))
 	}
 }
 
@@ -286,38 +283,6 @@ func watchEvents(db *freegeoip.DB) {
 		case <-db.NotifyClose():
 			return
 		}
+		time.Sleep(60 * time.Second)
 	}
-}
-
-func newRateLimiter(c *Config) (*httprl.RateLimiter, error) {
-	var backend httprl.Backend
-	switch c.RateLimitBackend {
-	case "map":
-		m := httprl.NewMap(1)
-		m.Start()
-		backend = m
-	case "redis":
-		addrs := strings.Split(c.RedisAddr, ",")
-		rc, err := redis.NewClient(addrs...)
-		if err != nil {
-			return nil, err
-		}
-		rc.SetTimeout(c.RedisTimeout)
-		backend = redisrl.New(rc)
-	case "memcache":
-		addrs := strings.Split(c.MemcacheAddr, ",")
-		mc := memcache.New(addrs...)
-		mc.Timeout = c.MemcacheTimeout
-		backend = memcacherl.New(mc)
-	default:
-		return nil, fmt.Errorf("unsupported backend: %q" + c.RateLimitBackend)
-	}
-	rl := &httprl.RateLimiter{
-		Backend:  backend,
-		Limit:    c.RateLimitLimit,
-		Interval: int32(c.RateLimitInterval.Seconds()),
-		ErrorLog: c.errorLogger(),
-		//Policy:   httprl.AllowPolicy,
-	}
-	return rl, nil
 }
