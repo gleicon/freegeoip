@@ -22,8 +22,8 @@ import (
 	"strings"
 	"time"
 
-	//	"github.com/fiorix/freegeoip"
 	"github.com/bradfitz/gomemcache/memcache"
+	"github.com/fiorix/freegeoip"
 	"github.com/fiorix/go-redis/redis"
 	"github.com/go-web/httplog"
 	"github.com/go-web/httpmux"
